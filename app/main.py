@@ -13,8 +13,9 @@ DB_PATH = os.getenv("DB_PATH", "/data/cpa_tracker.db")
 SLON_OFFER_URL = os.getenv("SLON_OFFER_URL", "")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
+DEBUG_CLICK_IDS = os.getenv("DEBUG_CLICK_IDS", "false").strip().lower() == "true"
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 app = FastAPI(title="CPA Tracker", version=APP_VERSION)
 
@@ -216,6 +217,18 @@ async def go_slon(request: Request):
     """, row)
     conn.commit()
     conn.close()
+
+    # Temporary, explicitly gated debug mode for attribution testing.
+    # Never expose click IDs publicly unless DEBUG_CLICK_IDS=true is enabled.
+    if DEBUG_CLICK_IDS and q.get("show_click") == "1":
+        return {
+            "ok": True,
+            "debug": True,
+            "click_id": click,
+            "subid": click,
+            "offer": "slon",
+            "next": "Open /go/slon normally after this test; this response intentionally does not redirect."
+        }
 
     target = add_query(SLON_OFFER_URL, {
         "subid": click,
