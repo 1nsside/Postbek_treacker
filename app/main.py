@@ -4,11 +4,13 @@ import io
 import json
 import sqlite3
 import uuid
+import hmac
+import hashlib
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 
 DB_PATH = os.getenv("DB_PATH", "/data/cpa_tracker.db")
 SLON_OFFER_URL = os.getenv("SLON_OFFER_URL", "")
@@ -16,7 +18,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
 DEBUG_CLICK_IDS = os.getenv("DEBUG_CLICK_IDS", "false").strip().lower() == "true"
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 APP_NAME = "CPA Tracker"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -169,10 +171,22 @@ def add_query(url, params):
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(existing), parts.fragment))
 
 
+ADMIN_COOKIE = "cpa_admin_session"
+
+def admin_session_value():
+    if not ADMIN_TOKEN or ADMIN_TOKEN == "change-me":
+        return ""
+    return hmac.new(ADMIN_TOKEN.encode(), b"cpa-tracker-admin-session-v1", hashlib.sha256).hexdigest()
+
 def check_admin(request: Request):
     token = request.headers.get("x-admin-token") or request.query_params.get("token")
+    cookie = request.cookies.get(ADMIN_COOKIE)
+    expected_cookie = admin_session_value()
+    if cookie and expected_cookie and hmac.compare_digest(cookie, expected_cookie):
+        return
     if not ADMIN_TOKEN or ADMIN_TOKEN == "change-me" or token != ADMIN_TOKEN:
         raise HTTPException(401, "Unauthorized")
+
 
 
 def check_postback_secret(request: Request):
@@ -291,6 +305,35 @@ async def postback(request: Request):
     cid = cur.lastrowid; conn.commit(); conn.close()
     return {"ok": True, "duplicate": False, "conversion_id": cid, "matched_click_id": rec["matched_click_id"]}
 
+
+
+LOGIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker — Login</title><style>body{font-family:system-ui;background:#0f1115;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0}.box{width:min(420px,90vw);background:#191c23;padding:28px;border-radius:16px;box-sizing:border-box}input,button{width:100%;box-sizing:border-box;padding:13px;margin-top:10px;border-radius:10px;border:1px solid #343944;background:#0f1115;color:#fff}button{background:#fff;color:#111;font-weight:700;cursor:pointer}</style></head><body><div class=\"box\"><h2>CPA Tracker</h2><p>Адмін-доступ</p><form method=\"post\" action=\"/admin/login\"><input name=\"token\" type=\"password\" placeholder=\"ADMIN_TOKEN\" autocomplete=\"current-password\" required><button>Увійти</button></form></div></body></html>"""
+
+ADMIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker Dashboard</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d11;color:#eee;margin:0}.wrap{max-width:1200px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#9aa1ad}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}.card{background:#171a21;border:1px solid #272c36;border-radius:14px;padding:14px}.label{color:#9aa1ad;font-size:12px}.value{font-size:22px;font-weight:750;margin-top:4px}section{background:#12151b;border:1px solid #272c36;border-radius:14px;padding:14px;margin-top:14px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:9px;border-bottom:1px solid #252a33;font-size:13px}th{color:#aeb5c1}button{border:1px solid #343a46;background:#1a1e27;color:#fff;padding:9px 12px;border-radius:9px;cursor:pointer}.danger{border-color:#6d3030}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}select{background:#171a21;color:#fff;border:1px solid #343a46;padding:9px;border-radius:9px}.pos{color:#76e09b}.neg{color:#ff8c8c}@media(max-width:600px){.wrap{padding:10px}.value{font-size:19px}}</style></head><body><div class=\"wrap\"><div class=\"top\"><div><h2 style=\"margin:0\">CPA Tracker</h2><div class=\"muted\">Адмін-панель · v0.3.1</div></div><div class=\"toolbar\"><button onclick=\"loadAll()\">Оновити</button><form method=\"post\" action=\"/admin/logout\"><button class=\"danger\">Вийти</button></form></div></div><div id=\"cards\" class=\"cards\"></div><section><div class=\"toolbar\"><b>Звіт</b><select id=\"group\" onchange=\"loadReport()\"><option value=\"campaign\">Campaign</option><option value=\"adgroup\">Ad Group</option><option value=\"creative\">Creative</option><option value=\"keyword\">Keyword</option></select></div><div id=\"report\" style=\"margin-top:10px\"></div></section><section><b>Останні конверсії</b><div id=\"convs\" style=\"margin-top:10px\"></div></section><section><b>Останні кліки</b><div id=\"clicks\" style=\"margin-top:10px\"></div></section></div><script>const money=x=>x==null?'—':Number(x).toLocaleString('uk-UA',{minimumFractionDigits:2,maximumFractionDigits:2})+' ₴';const pct=x=>x==null?'—':Number(x).toFixed(2)+'%';async function api(u){let r=await fetch(u,{credentials:'same-origin'});if(!r.ok){if(r.status===401)location.reload();throw new Error(await r.text())}return r.json()}function card(label,val){return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value\">${val}</div></div>`}async function loadStats(){let d=await api('/admin/stats');let cr=d.clicks?d.approved/d.clicks*100:null;document.getElementById('cards').innerHTML=[card('Clicks',d.clicks),card('Conversions',d.conversions),card('Approved',d.approved),card('CR',pct(cr)),card('Revenue',money(d.revenue_uah)),card('Spend',money(d.spend_uah)),card('Profit',`<span class=\"${d.profit_uah>=0?'pos':'neg'}\">${money(d.profit_uah)}</span>`),card('ROI',d.roi_percent==null?'—':pct(d.roi_percent))].join('')}async function loadReport(){let g=document.getElementById('group').value;let d=await api('/admin/report?group='+encodeURIComponent(g));let h='<table><tr><th>Group</th><th>Clicks</th><th>Conv.</th><th>Approved</th><th>CR</th><th>Revenue</th><th>Spend</th><th>Profit</th><th>ROI</th><th>EPC</th><th>CPA</th></tr>';for(let r of d.rows){h+=`<tr><td>${esc(r.group)}</td><td>${r.clicks}</td><td>${r.conversions}</td><td>${r.approved}</td><td>${pct(r.cr_click_to_approved_percent)}</td><td>${money(r.revenue_uah)}</td><td>${money(r.spend_uah)}</td><td class=\"${r.profit_uah>=0?'pos':'neg'}\">${money(r.profit_uah)}</td><td>${r.roi_percent==null?'—':pct(r.roi_percent)}</td><td>${r.epc_uah==null?'—':Number(r.epc_uah).toFixed(4)+' ₴'}</td><td>${r.cpa_uah==null?'—':money(r.cpa_uah)}</td></tr>`}h+='</table>';document.getElementById('report').innerHTML=h}async function loadConv(){let a=await api('/admin/conversions');let h='<table><tr><th>Time</th><th>Offer</th><th>Status</th><th>Revenue</th><th>Campaign</th><th>Click ID</th><th>Matched</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.received_at)}</td><td>${esc(r.offer_name||r.offer_id||'')}</td><td>${esc(r.status||'')}</td><td>${money(r.aff_rev_real??r.aff_rev)}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.click_id||'')}</td><td>${esc(r.matched_click_id||'')}</td></tr>`}document.getElementById('convs').innerHTML=h+'</table>'}async function loadClicks(){let a=await api('/admin/clicks');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign</th><th>Ad Group</th><th>Creative</th><th>Keyword</th><th>Device</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.created_at)}</td><td>${esc(r.utm_source||'')}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.utm_adgroup||'')}</td><td>${esc(r.utm_creative||'')}</td><td>${esc(r.utm_term||'')}</td><td>${esc(r.utm_device||'')}</td></tr>`}document.getElementById('clicks').innerHTML=h+'</table>'}function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function loadAll(){try{await Promise.all([loadStats(),loadReport(),loadConv(),loadClicks()])}catch(e){document.body.insertAdjacentHTML('beforeend',`<div style=\"position:fixed;bottom:10px;left:10px;right:10px;background:#4a2020;padding:12px;border-radius:10px\">Помилка: ${esc(e.message)}</div>`)}}loadAll();setInterval(loadAll,60000);</script></body></html>"""
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(request: Request):
+    session = request.cookies.get(ADMIN_COOKIE)
+    if session and admin_session_value() and hmac.compare_digest(session, admin_session_value()):
+        return HTMLResponse(ADMIN_HTML)
+    return HTMLResponse(LOGIN_HTML)
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    body = (await request.body()).decode("utf-8", errors="replace")
+    from urllib.parse import parse_qs
+    token = parse_qs(body).get("token", [""])[0]
+    if not ADMIN_TOKEN or ADMIN_TOKEN == "change-me" or not hmac.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(401, "Невірний ADMIN_TOKEN")
+    response = RedirectResponse("/admin", status_code=303)
+    response.set_cookie(ADMIN_COOKIE, admin_session_value(), httponly=True, secure=True, samesite="lax", max_age=86400)
+    return response
+
+@app.post("/admin/logout")
+def admin_logout():
+    response = RedirectResponse("/admin", status_code=303)
+    response.delete_cookie(ADMIN_COOKIE)
+    return response
 
 @app.get("/admin/stats")
 def stats(request: Request):
