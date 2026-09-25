@@ -2,7 +2,6 @@ import os
 import csv
 import io
 import json
-import sqlite3
 import uuid
 import hmac
 import hashlib
@@ -12,13 +11,13 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, HTMLResponse
 
-DB_PATH = os.getenv("DB_PATH", "/data/cpa_tracker.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SLON_OFFER_URL = os.getenv("SLON_OFFER_URL", "")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
 DEBUG_CLICK_IDS = os.getenv("DEBUG_CLICK_IDS", "false").strip().lower() == "true"
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.4.0-postgres"
 APP_NAME = "CPA Tracker"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -29,94 +28,158 @@ PENDING = ("pending", "очікує")
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+    import psycopg
+    from psycopg.rows import dict_row
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
 
 
 def init_db():
-    directory = os.path.dirname(DB_PATH)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
     conn = db()
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS clicks (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        offer TEXT NOT NULL,
-        subid TEXT UNIQUE NOT NULL,
-        subid2 TEXT, subid3 TEXT,
-        utm_source TEXT, utm_medium TEXT, utm_campaign TEXT,
-        utm_term TEXT, utm_adgroup TEXT, utm_creative TEXT,
-        utm_device TEXT, utm_adposition TEXT, gclid TEXT,
-        ip TEXT, user_agent TEXT
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS conversions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        received_at TEXT NOT NULL,
-        offer_id TEXT, offer_name TEXT, load_id TEXT,
-        transaction_id TEXT, status TEXT,
-        aff_rev REAL, aff_rev_real REAL,
-        real_currency TEXT, currency TEXT,
-        click_id TEXT, subid TEXT, subid2 TEXT, subid3 TEXT,
-        utm_source TEXT, utm_medium TEXT, utm_campaign TEXT,
-        utm_term TEXT, utm_adgroup TEXT, utm_adposition TEXT,
-        utm_creative TEXT, utm_device TEXT, gclid TEXT,
-        matched_click_id TEXT, raw_json TEXT
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS spend (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        spent_at TEXT NOT NULL,
-        source TEXT NOT NULL,
-        campaign TEXT NOT NULL,
-        adgroup TEXT,
-        creative TEXT,
-        keyword TEXT,
-        amount REAL NOT NULL,
-        currency TEXT NOT NULL DEFAULT 'UAH',
-        external_id TEXT,
-        note TEXT,
-        created_at TEXT NOT NULL
-    )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS offers (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        payout REAL,
-        currency TEXT DEFAULT 'UAH',
-        active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL
-    )
-    """)
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_tx ON conversions(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id <> ''")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_spend_external ON spend(external_id) WHERE external_id IS NOT NULL AND external_id <> ''")
-    for sql in [
-        "CREATE INDEX IF NOT EXISTS idx_clicks_created ON clicks(created_at)",
-        "CREATE INDEX IF NOT EXISTS idx_clicks_campaign ON clicks(utm_campaign)",
-        "CREATE INDEX IF NOT EXISTS idx_clicks_adgroup ON clicks(utm_adgroup)",
-        "CREATE INDEX IF NOT EXISTS idx_clicks_creative ON clicks(utm_creative)",
-        "CREATE INDEX IF NOT EXISTS idx_clicks_term ON clicks(utm_term)",
-        "CREATE INDEX IF NOT EXISTS idx_conv_status ON conversions(status)",
-        "CREATE INDEX IF NOT EXISTS idx_conv_subid ON conversions(subid)",
-        "CREATE INDEX IF NOT EXISTS idx_conv_click ON conversions(matched_click_id)",
-        "CREATE INDEX IF NOT EXISTS idx_spend_date ON spend(spent_at)",
-        "CREATE INDEX IF NOT EXISTS idx_spend_campaign ON spend(campaign)",
-    ]:
-        conn.execute(sql)
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS clicks (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            offer TEXT NOT NULL,
+            subid TEXT UNIQUE NOT NULL,
+            subid2 TEXT, subid3 TEXT,
+            utm_source TEXT, utm_medium TEXT, utm_campaign TEXT,
+            utm_term TEXT, utm_adgroup TEXT, utm_creative TEXT,
+            utm_content TEXT, utm_source_platform TEXT, utm_placement TEXT,
+            campaign_id TEXT, campaign_name TEXT, adgroup_id TEXT, adgroup_name TEXT,
+            creative_id TEXT, creative_name TEXT,
+            utm_device TEXT, utm_adposition TEXT, gclid TEXT, fbclid TEXT, msclkid TEXT, ttclid TEXT,
+            ip TEXT, user_agent TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversions (
+            id BIGSERIAL PRIMARY KEY,
+            received_at TEXT NOT NULL,
+            offer_id TEXT, offer_name TEXT, load_id TEXT,
+            transaction_id TEXT, status TEXT,
+            aff_rev DOUBLE PRECISION, aff_rev_real DOUBLE PRECISION,
+            real_currency TEXT, currency TEXT,
+            click_id TEXT, subid TEXT, subid2 TEXT, subid3 TEXT,
+            utm_source TEXT, utm_medium TEXT, utm_campaign TEXT,
+            utm_term TEXT, utm_adgroup TEXT, utm_adposition TEXT,
+            utm_creative TEXT, utm_device TEXT, gclid TEXT,
+            matched_click_id TEXT, raw_json TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS spend (
+            id BIGSERIAL PRIMARY KEY,
+            spent_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            campaign TEXT NOT NULL,
+            adgroup TEXT,
+            creative TEXT,
+            keyword TEXT,
+            amount DOUBLE PRECISION NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'UAH',
+            external_id TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS offers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            payout DOUBLE PRECISION,
+            currency TEXT DEFAULT 'UAH',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        """)
+        conn.execute("CREATE TABLE IF NOT EXISTS migration_state (key TEXT PRIMARY KEY, completed_at TEXT NOT NULL)")
+        for sql in [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_tx ON conversions(transaction_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_spend_external ON spend(external_id)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_created ON clicks(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_campaign ON clicks(utm_campaign)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_campaign_id ON clicks(campaign_id)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_adgroup ON clicks(utm_adgroup)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_adgroup_id ON clicks(adgroup_id)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_creative ON clicks(utm_creative)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_creative_id ON clicks(creative_id)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_term ON clicks(utm_term)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_gclid ON clicks(gclid)",
+            "CREATE INDEX IF NOT EXISTS idx_clicks_fbclid ON clicks(fbclid)",
+            "CREATE INDEX IF NOT EXISTS idx_conv_status ON conversions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_conv_subid ON conversions(subid)",
+            "CREATE INDEX IF NOT EXISTS idx_conv_click ON conversions(matched_click_id)",
+            "CREATE INDEX IF NOT EXISTS idx_spend_date ON spend(spent_at)",
+            "CREATE INDEX IF NOT EXISTS idx_spend_campaign ON spend(campaign)",
+        ]:
+            conn.execute(sql)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def migrate_legacy_sqlite():
+    # One-time best-effort migration of the existing Railway volume DB.
+    # PostgreSQL remains the only live database after this import.
+    legacy = os.getenv("LEGACY_SQLITE_PATH", "/data/cpa_tracker.db")
+    if not os.path.exists(legacy):
+        return {"migrated": False, "reason": "legacy_db_missing"}
+    import sqlite3
+    try:
+        src = sqlite3.connect(legacy)
+        src.row_factory = sqlite3.Row
+    except Exception:
+        return {"migrated": False, "reason": "legacy_db_unreadable"}
+    pg = db()
+    try:
+        marker = pg.execute("SELECT 1 FROM migration_state WHERE key=%s", ("sqlite_v033_v040",)).fetchone()
+        if marker:
+            return {"migrated": False, "reason": "already_migrated"}
+        counts = {"clicks": 0, "conversions": 0, "spend": 0, "offers": 0}
+        def rows(table):
+            try:
+                return src.execute(f"SELECT * FROM {table}").fetchall()
+            except Exception:
+                return []
+        for r in rows("clicks"):
+            d = dict(r)
+            cols = ["id","created_at","offer","subid","subid2","subid3","utm_source","utm_medium","utm_campaign","utm_term","utm_adgroup","utm_creative","utm_content","utm_source_platform","utm_placement","campaign_id","campaign_name","adgroup_id","adgroup_name","creative_id","creative_name","utm_device","utm_adposition","gclid","fbclid","msclkid","ttclid","ip","user_agent"]
+            vals = [d.get(c) for c in cols]
+            pg.execute("""INSERT INTO clicks (id,created_at,offer,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_creative,utm_content,utm_source_platform,utm_placement,campaign_id,campaign_name,adgroup_id,adgroup_name,creative_id,creative_name,utm_device,utm_adposition,gclid,fbclid,msclkid,ttclid,ip,user_agent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING""", vals)
+            counts["clicks"] += 1
+        for r in rows("conversions"):
+            d=dict(r); cols=["received_at","offer_id","offer_name","load_id","transaction_id","status","aff_rev","aff_rev_real","real_currency","currency","click_id","subid","subid2","subid3","utm_source","utm_medium","utm_campaign","utm_term","utm_adgroup","utm_adposition","utm_creative","utm_device","gclid","matched_click_id","raw_json"]
+            vals=[(d.get(c) or None) if c == "transaction_id" else d.get(c) for c in cols]
+            pg.execute("""INSERT INTO conversions (received_at,offer_id,offer_name,load_id,transaction_id,status,aff_rev,aff_rev_real,real_currency,currency,click_id,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_adposition,utm_creative,utm_device,gclid,matched_click_id,raw_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (transaction_id) DO NOTHING""", vals)
+            counts["conversions"] += 1
+        for r in rows("spend"):
+            d=dict(r); cols=["spent_at","source","campaign","adgroup","creative","keyword","amount","currency","external_id","note","created_at"]; vals=[(d.get(c) or None) if c == "external_id" else d.get(c) for c in cols]
+            pg.execute("""INSERT INTO spend (spent_at,source,campaign,adgroup,creative,keyword,amount,currency,external_id,note,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (external_id) DO NOTHING""", vals)
+            counts["spend"] += 1
+        for r in rows("offers"):
+            d=dict(r); vals=[d.get(c) for c in ["id","name","payout","currency","active","created_at"]]
+            pg.execute("""INSERT INTO offers (id,name,payout,currency,active,created_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING""", vals)
+            counts["offers"] += 1
+        pg.execute("INSERT INTO migration_state(key,completed_at) VALUES(%s,%s)", ("sqlite_v033_v040", now()))
+        pg.commit()
+        return {"migrated": True, "counts": counts}
+    except Exception:
+        pg.rollback()
+        raise
+    finally:
+        src.close(); pg.close()
 
 
 @app.on_event("startup")
 def startup():
     init_db()
+    migrate_legacy_sqlite()
 
 
 def now():
@@ -214,10 +277,10 @@ def status_kind(status):
 def date_filter(column, start, end):
     clauses, params = [], []
     if start:
-        clauses.append(f"{column} >= ?")
+        clauses.append(f"{column} >= %s")
         params.append(start)
     if end:
-        clauses.append(f"{column} < ?")
+        clauses.append(f"{column} < %s")
         params.append(end)
     return (" AND ".join(clauses) if clauses else "1=1"), params
 
@@ -246,18 +309,31 @@ async def go_slon(request: Request):
         "utm_source": clean(q.get("utm_source")), "utm_medium": clean(q.get("utm_medium")),
         "utm_campaign": clean(q.get("utm_campaign")), "utm_term": clean(q.get("utm_term")),
         "utm_adgroup": clean(q.get("utm_adgroup")), "utm_creative": clean(q.get("utm_creative")),
-        "utm_device": clean(q.get("utm_device")), "utm_adposition": clean(q.get("utm_adposition")),
-        "gclid": clean(q.get("gclid")), "ip": request.client.host if request.client else None,
-        "user_agent": request.headers.get("user-agent")
+        "utm_content": clean(q.get("utm_content")), "utm_source_platform": clean(q.get("utm_source_platform")),
+        "utm_placement": clean(q.get("utm_placement") or q.get("placement")),
+        "campaign_id": clean(q.get("campaign_id") or q.get("utm_campaign_id") or q.get("campaignid")),
+        "campaign_name": clean(q.get("campaign_name") or q.get("utm_campaign_name")),
+        "adgroup_id": clean(q.get("adgroup_id") or q.get("utm_adgroup_id") or q.get("adgroupid")),
+        "adgroup_name": clean(q.get("adgroup_name") or q.get("utm_adgroup_name")),
+        "creative_id": clean(q.get("creative_id") or q.get("utm_creative_id") or q.get("creative")),
+        "creative_name": clean(q.get("creative_name") or q.get("utm_creative_name")),
+        "utm_device": clean(q.get("utm_device") or q.get("device")), "utm_adposition": clean(q.get("utm_adposition") or q.get("adposition")),
+        "gclid": clean(q.get("gclid")), "fbclid": clean(q.get("fbclid")), "msclkid": clean(q.get("msclkid")), "ttclid": clean(q.get("ttclid")),
+        "ip": request.client.host if request.client else None, "user_agent": request.headers.get("user-agent")
     }
     conn = db()
     conn.execute("""INSERT INTO clicks
-      (id,created_at,offer,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_creative,utm_device,utm_adposition,gclid,ip,user_agent)
-      VALUES (:id,:created_at,:offer,:subid,:subid2,:subid3,:utm_source,:utm_medium,:utm_campaign,:utm_term,:utm_adgroup,:utm_creative,:utm_device,:utm_adposition,:gclid,:ip,:user_agent)""", row)
+      (id,created_at,offer,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_creative,utm_content,utm_source_platform,utm_placement,campaign_id,campaign_name,adgroup_id,adgroup_name,creative_id,creative_name,utm_device,utm_adposition,gclid,fbclid,msclkid,ttclid,ip,user_agent)
+      VALUES (:id,:created_at,:offer,:subid,:subid2,:subid3,:utm_source,:utm_medium,:utm_campaign,:utm_term,:utm_adgroup,:utm_creative,:utm_content,:utm_source_platform,:utm_placement,:campaign_id,:campaign_name,:adgroup_id,:adgroup_name,:creative_id,:creative_name,:utm_device,:utm_adposition,:gclid,:fbclid,:msclkid,:ttclid,:ip,:user_agent)""", row)
     conn.commit(); conn.close()
     if DEBUG_CLICK_IDS and q.get("show_click") == "1":
         return {"ok": True, "debug": True, "click_id": click, "subid": click, "offer": "slon"}
-    target = add_query(SLON_OFFER_URL, {k: row[k] for k in ["subid","subid2","subid3","utm_source","utm_medium","utm_campaign","utm_term","utm_adgroup","utm_creative","utm_device","utm_adposition","gclid"]})
+    forward_keys = [
+        "subid","subid2","subid3","utm_source","utm_medium","utm_campaign","utm_term","utm_adgroup","utm_creative",
+        "utm_content","utm_source_platform","utm_placement","campaign_id","campaign_name","adgroup_id","adgroup_name",
+        "creative_id","creative_name","utm_device","utm_adposition","gclid","fbclid","msclkid","ttclid"
+    ]
+    target = add_query(SLON_OFFER_URL, {k: row[k] for k in forward_keys})
     return RedirectResponse(target, status_code=302)
 
 
@@ -291,25 +367,25 @@ async def postback(request: Request):
     conn = db(); matched = None
     for candidate in (subid, canonical_click_id):
         if candidate:
-            matched = conn.execute("SELECT id FROM clicks WHERE id=? OR subid=? LIMIT 1", (candidate,candidate)).fetchone()
+            matched = conn.execute("SELECT id FROM clicks WHERE id=%s OR subid=%s LIMIT 1", (candidate,candidate)).fetchone()
             if matched: break
     rec["matched_click_id"] = matched["id"] if matched else None
     tx = rec["transaction_id"]
     if tx:
-        existing = conn.execute("SELECT id FROM conversions WHERE transaction_id=? LIMIT 1", (tx,)).fetchone()
+        existing = conn.execute("SELECT id FROM conversions WHERE transaction_id=%s LIMIT 1", (tx,)).fetchone()
         if existing:
             conn.close(); return {"ok": True, "duplicate": True, "conversion_id": existing["id"], "matched_click_id": rec["matched_click_id"]}
     cur = conn.execute("""INSERT INTO conversions
       (received_at,offer_id,offer_name,load_id,transaction_id,status,aff_rev,aff_rev_real,real_currency,currency,click_id,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_adposition,utm_creative,utm_device,gclid,matched_click_id,raw_json)
-      VALUES (:received_at,:offer_id,:offer_name,:load_id,:transaction_id,:status,:aff_rev,:aff_rev_real,:real_currency,:currency,:click_id,:subid,:subid2,:subid3,:utm_source,:utm_medium,:utm_campaign,:utm_term,:utm_adgroup,:utm_adposition,:utm_creative,:utm_device,:gclid,:matched_click_id,:raw_json)""", rec)
-    cid = cur.lastrowid; conn.commit(); conn.close()
+      VALUES (%(received_at)s,%(offer_id)s,%(offer_name)s,%(load_id)s,%(transaction_id)s,%(status)s,%(aff_rev)s,%(aff_rev_real)s,%(real_currency)s,%(currency)s,%(click_id)s,%(subid)s,%(subid2)s,%(subid3)s,%(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_term)s,%(utm_adgroup)s,%(utm_adposition)s,%(utm_creative)s,%(utm_device)s,%(gclid)s,%(matched_click_id)s,%(raw_json)s) RETURNING id""", rec)
+    cid = cur.fetchone()["id"]; conn.commit(); conn.close()
     return {"ok": True, "duplicate": False, "conversion_id": cid, "matched_click_id": rec["matched_click_id"]}
 
 
 
 LOGIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker — Login</title><style>body{font-family:system-ui;background:#0f1115;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0}.box{width:min(420px,90vw);background:#191c23;padding:28px;border-radius:16px;box-sizing:border-box}input,button{width:100%;box-sizing:border-box;padding:13px;margin-top:10px;border-radius:10px;border:1px solid #343944;background:#0f1115;color:#fff}button{background:#fff;color:#111;font-weight:700;cursor:pointer}</style></head><body><div class=\"box\"><h2>CPA Tracker</h2><p>Адмін-доступ</p><form method=\"post\" action=\"/admin/login\"><input name=\"token\" type=\"password\" placeholder=\"ADMIN_TOKEN\" autocomplete=\"current-password\" required><button>Увійти</button></form></div></body></html>"""
 
-ADMIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker Dashboard</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d11;color:#eee;margin:0}.wrap{max-width:1200px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#9aa1ad}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}.card{background:#171a21;border:1px solid #272c36;border-radius:14px;padding:14px}.label{color:#9aa1ad;font-size:12px}.value{font-size:22px;font-weight:750;margin-top:4px}section{background:#12151b;border:1px solid #272c36;border-radius:14px;padding:14px;margin-top:14px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:9px;border-bottom:1px solid #252a33;font-size:13px}th{color:#aeb5c1}button{border:1px solid #343a46;background:#1a1e27;color:#fff;padding:9px 12px;border-radius:9px;cursor:pointer}.danger{border-color:#6d3030}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}select{background:#171a21;color:#fff;border:1px solid #343a46;padding:9px;border-radius:9px}.pos{color:#76e09b}.neg{color:#ff8c8c}@media(max-width:600px){.wrap{padding:10px}.value{font-size:19px}}</style></head><body><div class=\"wrap\"><div class=\"top\"><div><h2 style=\"margin:0\">CPA Tracker</h2><div class=\"muted\">Адмін-панель · v0.3.3</div></div><div class=\"toolbar\"><button onclick=\"loadAll()\">Оновити</button><form method=\"post\" action=\"/admin/logout\"><button class=\"danger\">Вийти</button></form></div></div><div id=\"cards\" class=\"cards\"></div><section><div class=\"toolbar\"><b>Звіт</b><select id=\"group\" onchange=\"loadReport()\"><option value=\"campaign\">Campaign</option><option value=\"adgroup\">Ad Group</option><option value=\"creative\">Creative</option><option value=\"keyword\">Keyword</option></select></div><div id=\"report\" style=\"margin-top:10px\"></div></section><section><b>Останні конверсії</b><div id=\"convs\" style=\"margin-top:10px\"></div></section><section><div class=\"toolbar\"><b>Витрати</b><span class=\"muted\">CSV: spent_at, source, campaign, amount</span></div><form id=\"spendForm\" style=\"margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center\"><input id=\"spendFile\" type=\"file\" accept=\".csv,text/csv\" required style=\"max-width:100%\"><button type=\"submit\">Імпортувати CSV</button></form><div id=\"spendMsg\" class=\"muted\" style=\"margin-top:8px\"></div><div id=\"spend\" style=\"margin-top:10px\"></div></section><section><b>Останні кліки</b><div id=\"clicks\" style=\"margin-top:10px\"></div></section></div><script>const money=x=>x==null?'—':Number(x).toLocaleString('uk-UA',{minimumFractionDigits:2,maximumFractionDigits:2})+' ₴';const pct=x=>x==null?'—':Number(x).toFixed(2)+'%';async function api(u){let r=await fetch(u,{credentials:'same-origin'});if(!r.ok){if(r.status===401)location.reload();throw new Error(await r.text())}return r.json()}function card(label,val){return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value\">${val}</div></div>`}async function loadStats(){let d=await api('/admin/stats');let cr=d.clicks?d.approved/d.clicks*100:null;document.getElementById('cards').innerHTML=[card('Clicks',d.clicks),card('Conversions',d.conversions),card('Approved',d.approved),card('CR',pct(cr)),card('Revenue',money(d.revenue_uah)),card('Spend',money(d.spend_uah)),card('Profit',`<span class=\"${d.profit_uah>=0?'pos':'neg'}\">${money(d.profit_uah)}</span>`),card('ROI',d.roi_percent==null?'—':pct(d.roi_percent))].join('')}async function loadReport(){let g=document.getElementById('group').value;let d=await api('/admin/report?group='+encodeURIComponent(g));let h='<table><tr><th>Group</th><th>Clicks</th><th>Conv.</th><th>Approved</th><th>CR</th><th>Revenue</th><th>Spend</th><th>Profit</th><th>ROI</th><th>EPC</th><th>CPA</th></tr>';for(let r of d.rows){h+=`<tr><td>${esc(r.group)}</td><td>${r.clicks}</td><td>${r.conversions}</td><td>${r.approved}</td><td>${pct(r.cr_click_to_approved_percent)}</td><td>${money(r.revenue_uah)}</td><td>${money(r.spend_uah)}</td><td class=\"${r.profit_uah>=0?'pos':'neg'}\">${money(r.profit_uah)}</td><td>${r.roi_percent==null?'—':pct(r.roi_percent)}</td><td>${r.epc_uah==null?'—':Number(r.epc_uah).toFixed(4)+' ₴'}</td><td>${r.cpa_uah==null?'—':money(r.cpa_uah)}</td></tr>`}h+='</table>';document.getElementById('report').innerHTML=h}async function loadConv(){let a=await api('/admin/conversions');let h='<table><tr><th>Time</th><th>Offer</th><th>Status</th><th>Revenue</th><th>Campaign</th><th>Click ID</th><th>Matched</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.received_at)}</td><td>${esc(r.offer_name||r.offer_id||'')}</td><td>${esc(r.status||'')}</td><td>${money(r.aff_rev_real??r.aff_rev)}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.click_id||'')}</td><td>${esc(r.matched_click_id||'')}</td></tr>`}document.getElementById('convs').innerHTML=h+'</table>'}async function loadClicks(){let a=await api('/admin/clicks');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign</th><th>Ad Group</th><th>Creative</th><th>Keyword</th><th>Device</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.created_at)}</td><td>${esc(r.utm_source||'')}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.utm_adgroup||'')}</td><td>${esc(r.utm_creative||'')}</td><td>${esc(r.utm_term||'')}</td><td>${esc(r.utm_device||'')}</td></tr>`}document.getElementById('clicks').innerHTML=h+'</table>'}async function loadSpend(){let a=await api('/admin/spend');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign</th><th>Ad Group</th><th>Creative</th><th>Keyword</th><th>Amount</th><th>Currency</th><th>ID</th><th>Дія</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.spent_at)}</td><td>${esc(r.source)}</td><td>${esc(r.campaign)}</td><td>${esc(r.adgroup||'')}</td><td>${esc(r.creative||'')}</td><td>${esc(r.keyword||'')}</td><td>${money(r.amount)}</td><td>${esc(r.currency||'')}</td><td>${esc(r.external_id||'')}</td><td><button class="danger" onclick="deleteSpend(${r.id})">Видалити</button></td></tr>`}document.getElementById('spend').innerHTML=h+'</table>'}async function deleteSpend(id){if(!confirm('Видалити цей запис витрат? Це змінить Spend, Profit та ROI.'))return;let r=await fetch('/admin/spend/'+id,{method:'DELETE',credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка видалення');document.getElementById('spendMsg').textContent=`Витрату #${id} видалено`;await loadAll()}async function importSpend(e){e.preventDefault();let f=document.getElementById('spendFile').files[0];if(!f)return;let fd=new FormData();fd.append('file',f);let r=await fetch('/admin/spend/csv',{method:'POST',body:fd,credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка імпорту');document.getElementById('spendMsg').textContent=`Додано: ${d.added} · Дублікати: ${d.duplicates} · Пропущено: ${d.skipped}`;document.getElementById('spendFile').value='';await loadAll()}function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function loadAll(){try{await Promise.all([loadStats(),loadReport(),loadConv(),loadClicks(),loadSpend()])}catch(e){document.body.insertAdjacentHTML('beforeend',`<div style=\"position:fixed;bottom:10px;left:10px;right:10px;background:#4a2020;padding:12px;border-radius:10px\">Помилка: ${esc(e.message)}</div>`)}}document.getElementById('spendForm').addEventListener('submit',importSpend);loadAll();setInterval(loadAll,60000);</script></body></html>"""
+ADMIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker Dashboard</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d11;color:#eee;margin:0}.wrap{max-width:1200px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#9aa1ad}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}.card{background:#171a21;border:1px solid #272c36;border-radius:14px;padding:14px}.label{color:#9aa1ad;font-size:12px}.value{font-size:22px;font-weight:750;margin-top:4px}section{background:#12151b;border:1px solid #272c36;border-radius:14px;padding:14px;margin-top:14px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:9px;border-bottom:1px solid #252a33;font-size:13px}th{color:#aeb5c1}button{border:1px solid #343a46;background:#1a1e27;color:#fff;padding:9px 12px;border-radius:9px;cursor:pointer}.danger{border-color:#6d3030}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}select{background:#171a21;color:#fff;border:1px solid #343a46;padding:9px;border-radius:9px}.pos{color:#76e09b}.neg{color:#ff8c8c}@media(max-width:600px){.wrap{padding:10px}.value{font-size:19px}}</style></head><body><div class=\"wrap\"><div class=\"top\"><div><h2 style=\"margin:0\">CPA Tracker</h2><div class=\"muted\">Адмін-панель · v0.4.0</div></div><div class=\"toolbar\"><button onclick=\"loadAll()\">Оновити</button><form method=\"post\" action=\"/admin/logout\"><button class=\"danger\">Вийти</button></form></div></div><div id=\"cards\" class=\"cards\"></div><section><div class=\"toolbar\"><b>Звіт</b><select id=\"group\" onchange=\"loadReport()\"><option value=\"campaign\">Campaign</option><option value=\"adgroup\">Ad Group</option><option value=\"creative\">Creative</option><option value=\"keyword\">Keyword</option></select></div><div id=\"report\" style=\"margin-top:10px\"></div></section><section><b>Останні конверсії</b><div id=\"convs\" style=\"margin-top:10px\"></div></section><section><div class=\"toolbar\"><b>Витрати</b><span class=\"muted\">CSV: spent_at, source, campaign, amount</span></div><form id=\"spendForm\" style=\"margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center\"><input id=\"spendFile\" type=\"file\" accept=\".csv,text/csv\" required style=\"max-width:100%\"><button type=\"submit\">Імпортувати CSV</button></form><div id=\"spendMsg\" class=\"muted\" style=\"margin-top:8px\"></div><div id=\"spend\" style=\"margin-top:10px\"></div></section><section><b>Останні кліки</b><div id=\"clicks\" style=\"margin-top:10px\"></div></section></div><script>const money=x=>x==null?'—':Number(x).toLocaleString('uk-UA',{minimumFractionDigits:2,maximumFractionDigits:2})+' ₴';const pct=x=>x==null?'—':Number(x).toFixed(2)+'%';async function api(u){let r=await fetch(u,{credentials:'same-origin'});if(!r.ok){if(r.status===401)location.reload();throw new Error(await r.text())}return r.json()}function card(label,val){return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value\">${val}</div></div>`}async function loadStats(){let d=await api('/admin/stats');let cr=d.clicks?d.approved/d.clicks*100:null;document.getElementById('cards').innerHTML=[card('Clicks',d.clicks),card('Conversions',d.conversions),card('Approved',d.approved),card('CR',pct(cr)),card('Revenue',money(d.revenue_uah)),card('Spend',money(d.spend_uah)),card('Profit',`<span class=\"${d.profit_uah>=0?'pos':'neg'}\">${money(d.profit_uah)}</span>`),card('ROI',d.roi_percent==null?'—':pct(d.roi_percent))].join('')}async function loadReport(){let g=document.getElementById('group').value;let d=await api('/admin/report?group='+encodeURIComponent(g));let h='<table><tr><th>Group</th><th>Clicks</th><th>Conv.</th><th>Approved</th><th>CR</th><th>Revenue</th><th>Spend</th><th>Profit</th><th>ROI</th><th>EPC</th><th>CPA</th></tr>';for(let r of d.rows){h+=`<tr><td>${esc(r.group)}</td><td>${r.clicks}</td><td>${r.conversions}</td><td>${r.approved}</td><td>${pct(r.cr_click_to_approved_percent)}</td><td>${money(r.revenue_uah)}</td><td>${money(r.spend_uah)}</td><td class=\"${r.profit_uah>=0?'pos':'neg'}\">${money(r.profit_uah)}</td><td>${r.roi_percent==null?'—':pct(r.roi_percent)}</td><td>${r.epc_uah==null?'—':Number(r.epc_uah).toFixed(4)+' ₴'}</td><td>${r.cpa_uah==null?'—':money(r.cpa_uah)}</td></tr>`}h+='</table>';document.getElementById('report').innerHTML=h}async function loadConv(){let a=await api('/admin/conversions');let h='<table><tr><th>Time</th><th>Offer</th><th>Status</th><th>Revenue</th><th>Campaign</th><th>Click ID</th><th>Matched</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.received_at)}</td><td>${esc(r.offer_name||r.offer_id||'')}</td><td>${esc(r.status||'')}</td><td>${money(r.aff_rev_real??r.aff_rev)}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.click_id||'')}</td><td>${esc(r.matched_click_id||'')}</td></tr>`}document.getElementById('convs').innerHTML=h+'</table>'}async function loadClicks(){let a=await api('/admin/clicks');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign ID</th><th>Campaign</th><th>Ad Group ID</th><th>Ad Group</th><th>Creative ID</th><th>Keyword</th><th>Device</th><th>Click IDs</th></tr>';for(let r of a.slice(0,50)){let ids=[r.gclid&&('G:'+r.gclid),r.fbclid&&('F:'+r.fbclid)].filter(Boolean).join(' ');h+=`<tr><td>${esc(r.created_at)}</td><td>${esc(r.utm_source||'')}</td><td>${esc(r.campaign_id||'')}</td><td>${esc(r.campaign_name||r.utm_campaign||'')}</td><td>${esc(r.adgroup_id||'')}</td><td>${esc(r.adgroup_name||r.utm_adgroup||'')}</td><td>${esc(r.creative_id||r.utm_creative||'')}</td><td>${esc(r.utm_term||'')}</td><td>${esc(r.utm_device||'')}</td><td>${esc(ids)}</td></tr>`}document.getElementById('clicks').innerHTML=h+'</table>'}async function loadSpend(){let a=await api('/admin/spend');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign</th><th>Ad Group</th><th>Creative</th><th>Keyword</th><th>Amount</th><th>Currency</th><th>ID</th><th>Дія</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.spent_at)}</td><td>${esc(r.source)}</td><td>${esc(r.campaign)}</td><td>${esc(r.adgroup||'')}</td><td>${esc(r.creative||'')}</td><td>${esc(r.keyword||'')}</td><td>${money(r.amount)}</td><td>${esc(r.currency||'')}</td><td>${esc(r.external_id||'')}</td><td><button class="danger" onclick="deleteSpend(${r.id})">Видалити</button></td></tr>`}document.getElementById('spend').innerHTML=h+'</table>'}async function deleteSpend(id){if(!confirm('Видалити цей запис витрат? Це змінить Spend, Profit та ROI.'))return;let r=await fetch('/admin/spend/'+id,{method:'DELETE',credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка видалення');document.getElementById('spendMsg').textContent=`Витрату #${id} видалено`;await loadAll()}async function importSpend(e){e.preventDefault();let f=document.getElementById('spendFile').files[0];if(!f)return;let fd=new FormData();fd.append('file',f);let r=await fetch('/admin/spend/csv',{method:'POST',body:fd,credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка імпорту');document.getElementById('spendMsg').textContent=`Додано: ${d.added} · Дублікати: ${d.duplicates} · Пропущено: ${d.skipped}`;document.getElementById('spendFile').value='';await loadAll()}function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function loadAll(){try{await Promise.all([loadStats(),loadReport(),loadConv(),loadClicks(),loadSpend()])}catch(e){document.body.insertAdjacentHTML('beforeend',`<div style=\"position:fixed;bottom:10px;left:10px;right:10px;background:#4a2020;padding:12px;border-radius:10px\">Помилка: ${esc(e.message)}</div>`)}}document.getElementById('spendForm').addEventListener('submit',importSpend);loadAll();setInterval(loadAll,60000);</script></body></html>"""
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(request: Request):
@@ -379,9 +455,9 @@ async def add_spend(request: Request):
         if not spent_at or amount is None or amount < 0 or not source or not campaign:
             continue
         ext=clean(r.get("external_id"))
-        if ext and conn.execute("SELECT 1 FROM spend WHERE external_id=?",(ext,)).fetchone():
+        if ext and conn.execute("SELECT 1 FROM spend WHERE external_id=%s",(ext,)).fetchone():
             duplicates+=1; continue
-        conn.execute("INSERT INTO spend(spent_at,source,campaign,adgroup,creative,keyword,amount,currency,external_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO spend(spent_at,source,campaign,adgroup,creative,keyword,amount,currency,external_id,note,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                      (spent_at.isoformat(),source,campaign,clean(r.get("adgroup")),clean(r.get("creative")),clean(r.get("keyword")),amount,clean(r.get("currency")) or "UAH",ext,clean(r.get("note")),now()))
         added+=1
     conn.commit(); conn.close(); return {"ok":True,"added":added,"duplicates":duplicates}
@@ -391,11 +467,11 @@ async def add_spend(request: Request):
 def delete_spend(spend_id: int, request: Request):
     check_admin(request)
     conn = db()
-    row = conn.execute("SELECT id FROM spend WHERE id=?", (spend_id,)).fetchone()
+    row = conn.execute("SELECT id FROM spend WHERE id=%s", (spend_id,)).fetchone()
     if not row:
         conn.close()
         raise HTTPException(404, "Витрату не знайдено")
-    conn.execute("DELETE FROM spend WHERE id=?", (spend_id,))
+    conn.execute("DELETE FROM spend WHERE id=%s", (spend_id,))
     conn.commit()
     conn.close()
     return {"ok": True, "deleted_id": spend_id}
@@ -419,9 +495,9 @@ async def import_spend_csv(request: Request, file: UploadFile = File(...)):
         if not spent_at or amount is None or amount < 0 or not source or not campaign:
             skipped+=1; continue
         ext=clean(r.get("external_id"))
-        if ext and conn.execute("SELECT 1 FROM spend WHERE external_id=?",(ext,)).fetchone():
+        if ext and conn.execute("SELECT 1 FROM spend WHERE external_id=%s",(ext,)).fetchone():
             duplicates+=1; continue
-        conn.execute("INSERT INTO spend(spent_at,source,campaign,adgroup,creative,keyword,amount,currency,external_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO spend(spent_at,source,campaign,adgroup,creative,keyword,amount,currency,external_id,note,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                      (spent_at.isoformat(),source,campaign,clean(r.get("adgroup")),clean(r.get("creative")),clean(r.get("keyword")),amount,clean(r.get("currency")) or "UAH",ext,clean(r.get("note")),now()))
         added+=1
     conn.commit(); conn.close(); return {"ok":True,"added":added,"duplicates":duplicates,"skipped":skipped}
@@ -484,4 +560,4 @@ def campaigns(request: Request, start: str|None=None, end: str|None=None):
 async def add_offer(request: Request):
     check_admin(request); data=await request.json(); oid=clean(data.get("id")); name=clean(data.get("name"))
     if not oid or not name: raise HTTPException(400,"id and name are required")
-    conn=db(); conn.execute("INSERT OR REPLACE INTO offers(id,name,payout,currency,active,created_at) VALUES(?,?,?,?,?,?)",(oid,name,parse_float(data.get("payout")),clean(data.get("currency")) or "UAH",1 if data.get("active",True) else 0,now())); conn.commit(); conn.close(); return {"ok":True,"id":oid}
+    conn=db(); conn.execute("""INSERT INTO offers(id,name,payout,currency,active,created_at) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,payout=EXCLUDED.payout,currency=EXCLUDED.currency,active=EXCLUDED.active""",(oid,name,parse_float(data.get("payout")),clean(data.get("currency")) or "UAH",1 if data.get("active",True) else 0,now())); conn.commit(); conn.close(); return {"ok":True,"id":oid}
