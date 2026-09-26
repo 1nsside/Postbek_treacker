@@ -324,7 +324,7 @@ async def go_slon(request: Request):
     conn = db()
     conn.execute("""INSERT INTO clicks
       (id,created_at,offer,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_creative,utm_content,utm_source_platform,utm_placement,campaign_id,campaign_name,adgroup_id,adgroup_name,creative_id,creative_name,utm_device,utm_adposition,gclid,fbclid,msclkid,ttclid,ip,user_agent)
-      VALUES (:id,:created_at,:offer,:subid,:subid2,:subid3,:utm_source,:utm_medium,:utm_campaign,:utm_term,:utm_adgroup,:utm_creative,:utm_content,:utm_source_platform,:utm_placement,:campaign_id,:campaign_name,:adgroup_id,:adgroup_name,:creative_id,:creative_name,:utm_device,:utm_adposition,:gclid,:fbclid,:msclkid,:ttclid,:ip,:user_agent)""", row)
+      VALUES (%(id)s,%(created_at)s,%(offer)s,%(subid)s,%(subid2)s,%(subid3)s,%(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_term)s,%(utm_adgroup)s,%(utm_creative)s,%(utm_content)s,%(utm_source_platform)s,%(utm_placement)s,%(campaign_id)s,%(campaign_name)s,%(adgroup_id)s,%(adgroup_name)s,%(creative_id)s,%(creative_name)s,%(utm_device)s,%(utm_adposition)s,%(gclid)s,%(fbclid)s,%(msclkid)s,%(ttclid)s,%(ip)s,%(user_agent)s)""", row)
     conn.commit(); conn.close()
     if DEBUG_CLICK_IDS and q.get("show_click") == "1":
         return {"ok": True, "debug": True, "click_id": click, "subid": click, "offer": "slon"}
