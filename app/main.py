@@ -17,7 +17,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "").strip()
 DEBUG_CLICK_IDS = os.getenv("DEBUG_CLICK_IDS", "false").strip().lower() == "true"
 
-APP_VERSION = "0.4.0-postgres"
+APP_VERSION = "0.4.1-postgres"
 APP_NAME = "CPA Tracker"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -92,9 +92,28 @@ def init_db():
             payout DOUBLE PRECISION,
             currency TEXT DEFAULT 'UAH',
             active INTEGER NOT NULL DEFAULT 1,
+            target_url TEXT,
             created_at TEXT NOT NULL
         )
         """)
+        # Schema upgrades for databases created by v0.4.0.
+        # ADD COLUMN IF NOT EXISTS is safe on the existing PostgreSQL database.
+        for sql in [
+            "ALTER TABLE offers ADD COLUMN IF NOT EXISTS target_url TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS utm_content TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS utm_source_platform TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS utm_placement TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS campaign_id TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS campaign_name TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS adgroup_id TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS adgroup_name TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS creative_id TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS creative_name TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS fbclid TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS msclkid TEXT",
+            "ALTER TABLE conversions ADD COLUMN IF NOT EXISTS ttclid TEXT",
+        ]:
+            conn.execute(sql)
         conn.execute("CREATE TABLE IF NOT EXISTS migration_state (key TEXT PRIMARY KEY, completed_at TEXT NOT NULL)")
         for sql in [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_tx ON conversions(transaction_id)",
@@ -288,7 +307,7 @@ def date_filter(column, start, end):
 @app.get("/")
 def root():
     return {"service": APP_NAME, "status": "ok", "version": APP_VERSION,
-            "endpoints": ["/go/slon", "/postback", "/health", "/admin/stats", "/admin/report", "/admin/spend", "/admin/campaigns"]}
+            "endpoints": ["/go/slon", "/postback", "/health", "/admin/stats", "/admin/report", "/admin/spend", "/admin/campaigns", "/admin/offers", "/go/offer/{offer_id}"]}
 
 
 @app.get("/health")
@@ -297,14 +316,11 @@ def health():
     return {"ok": True, "time": now(), "version": APP_VERSION}
 
 
-@app.get("/go/slon")
-async def go_slon(request: Request):
-    if not SLON_OFFER_URL:
-        raise HTTPException(500, "SLON_OFFER_URL is not configured")
+def _click_row(request: Request, offer_key: str):
     q = request.query_params
     click = "c_" + uuid.uuid4().hex[:20]
     row = {
-        "id": click, "created_at": now(), "offer": "slon", "subid": click,
+        "id": click, "created_at": now(), "offer": offer_key, "subid": click,
         "subid2": clean(q.get("subid2")), "subid3": clean(q.get("subid3")),
         "utm_source": clean(q.get("utm_source")), "utm_medium": clean(q.get("utm_medium")),
         "utm_campaign": clean(q.get("utm_campaign")), "utm_term": clean(q.get("utm_term")),
@@ -317,24 +333,56 @@ async def go_slon(request: Request):
         "adgroup_name": clean(q.get("adgroup_name") or q.get("utm_adgroup_name")),
         "creative_id": clean(q.get("creative_id") or q.get("utm_creative_id") or q.get("creative")),
         "creative_name": clean(q.get("creative_name") or q.get("utm_creative_name")),
-        "utm_device": clean(q.get("utm_device") or q.get("device")), "utm_adposition": clean(q.get("utm_adposition") or q.get("adposition")),
-        "gclid": clean(q.get("gclid")), "fbclid": clean(q.get("fbclid")), "msclkid": clean(q.get("msclkid")), "ttclid": clean(q.get("ttclid")),
-        "ip": request.client.host if request.client else None, "user_agent": request.headers.get("user-agent")
+        "utm_device": clean(q.get("utm_device") or q.get("device")),
+        "utm_adposition": clean(q.get("utm_adposition") or q.get("adposition")),
+        "gclid": clean(q.get("gclid")), "fbclid": clean(q.get("fbclid")),
+        "msclkid": clean(q.get("msclkid")), "ttclid": clean(q.get("ttclid")),
+        "ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent")
     }
+    return row
+
+
+def _store_click_and_redirect(request: Request, offer_key: str, target_url: str):
+    if not target_url:
+        raise HTTPException(500, "Offer target URL is not configured")
+    q = request.query_params
+    row = _click_row(request, offer_key)
     conn = db()
     conn.execute("""INSERT INTO clicks
       (id,created_at,offer,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_creative,utm_content,utm_source_platform,utm_placement,campaign_id,campaign_name,adgroup_id,adgroup_name,creative_id,creative_name,utm_device,utm_adposition,gclid,fbclid,msclkid,ttclid,ip,user_agent)
       VALUES (%(id)s,%(created_at)s,%(offer)s,%(subid)s,%(subid2)s,%(subid3)s,%(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_term)s,%(utm_adgroup)s,%(utm_creative)s,%(utm_content)s,%(utm_source_platform)s,%(utm_placement)s,%(campaign_id)s,%(campaign_name)s,%(adgroup_id)s,%(adgroup_name)s,%(creative_id)s,%(creative_name)s,%(utm_device)s,%(utm_adposition)s,%(gclid)s,%(fbclid)s,%(msclkid)s,%(ttclid)s,%(ip)s,%(user_agent)s)""", row)
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     if DEBUG_CLICK_IDS and q.get("show_click") == "1":
-        return {"ok": True, "debug": True, "click_id": click, "subid": click, "offer": "slon"}
+        return {"ok": True, "debug": True, "click_id": row["id"], "subid": row["subid"], "offer": offer_key}
     forward_keys = [
         "subid","subid2","subid3","utm_source","utm_medium","utm_campaign","utm_term","utm_adgroup","utm_creative",
         "utm_content","utm_source_platform","utm_placement","campaign_id","campaign_name","adgroup_id","adgroup_name",
         "creative_id","creative_name","utm_device","utm_adposition","gclid","fbclid","msclkid","ttclid"
     ]
-    target = add_query(SLON_OFFER_URL, {k: row[k] for k in forward_keys})
+    target = add_query(target_url, {k: row[k] for k in forward_keys})
     return RedirectResponse(target, status_code=302)
+
+
+@app.get("/go/slon")
+async def go_slon(request: Request):
+    # Backward-compatible route used by all existing Slon tests/campaigns.
+    return _store_click_and_redirect(request, "slon", SLON_OFFER_URL)
+
+
+@app.get("/go/offer/{offer_id}")
+async def go_offer(request: Request, offer_id: str):
+    conn = db()
+    offer = conn.execute(
+        "SELECT id,name,target_url,active FROM offers WHERE id=%s LIMIT 1", (offer_id,)
+    ).fetchone()
+    conn.close()
+    if not offer:
+        raise HTTPException(404, "Offer not found")
+    if not offer["active"]:
+        raise HTTPException(410, "Offer is inactive")
+    return _store_click_and_redirect(request, str(offer["id"]), offer["target_url"])
 
 
 @app.get("/postback")
@@ -358,26 +406,45 @@ async def postback(request: Request):
         "status": clean(data.get("lead_status")), "aff_rev": parse_float(data.get("aff_rev")),
         "aff_rev_real": parse_float(data.get("aff_rev_real")), "real_currency": clean(data.get("real_cur")),
         "currency": clean(data.get("currency")), "click_id": canonical_click_id, "subid": subid,
-        "subid2": clean(data.get("subid2")), "subid3": clean(data.get("subid3")), "utm_source": clean(data.get("utm_source")),
-        "utm_medium": clean(data.get("utm_medium")), "utm_campaign": clean(data.get("utm_campaign")), "utm_term": clean(data.get("utm_term")),
+        "subid2": clean(data.get("subid2")), "subid3": clean(data.get("subid3")),
+        "utm_source": clean(data.get("utm_source")), "utm_medium": clean(data.get("utm_medium")),
+        "utm_campaign": clean(data.get("utm_campaign")), "utm_term": clean(data.get("utm_term")),
         "utm_adgroup": clean(data.get("utm_adgroup")), "utm_adposition": clean(data.get("utm_adposition")),
-        "utm_creative": clean(data.get("utm_creative")), "utm_device": clean(data.get("utm_device")), "gclid": clean(data.get("gclid")),
+        "utm_creative": clean(data.get("utm_creative")), "utm_device": clean(data.get("utm_device")),
+        "utm_content": clean(data.get("utm_content")), "utm_source_platform": clean(data.get("utm_source_platform")),
+        "utm_placement": clean(data.get("utm_placement") or data.get("placement")),
+        "campaign_id": clean(data.get("campaign_id")), "campaign_name": clean(data.get("campaign_name")),
+        "adgroup_id": clean(data.get("adgroup_id")), "adgroup_name": clean(data.get("adgroup_name")),
+        "creative_id": clean(data.get("creative_id")), "creative_name": clean(data.get("creative_name")),
+        "gclid": clean(data.get("gclid")), "fbclid": clean(data.get("fbclid")),
+        "msclkid": clean(data.get("msclkid")), "ttclid": clean(data.get("ttclid")),
         "raw_json": json.dumps(data, ensure_ascii=False)
     }
     conn = db(); matched = None
     for candidate in (subid, canonical_click_id):
         if candidate:
-            matched = conn.execute("SELECT id FROM clicks WHERE id=%s OR subid=%s LIMIT 1", (candidate,candidate)).fetchone()
+            matched = conn.execute("SELECT * FROM clicks WHERE id=%s OR subid=%s LIMIT 1", (candidate,candidate)).fetchone()
             if matched: break
     rec["matched_click_id"] = matched["id"] if matched else None
+
+    # If the network postback omits attribution fields, recover them from the original click.
+    if matched:
+        for key in (
+            "subid2","subid3","utm_source","utm_medium","utm_campaign","utm_term","utm_adgroup",
+            "utm_adposition","utm_creative","utm_device","utm_content","utm_source_platform","utm_placement",
+            "campaign_id","campaign_name","adgroup_id","adgroup_name","creative_id","creative_name",
+            "gclid","fbclid","msclkid","ttclid"
+        ):
+            if not rec.get(key):
+                rec[key] = matched.get(key)
     tx = rec["transaction_id"]
     if tx:
         existing = conn.execute("SELECT id FROM conversions WHERE transaction_id=%s LIMIT 1", (tx,)).fetchone()
         if existing:
             conn.close(); return {"ok": True, "duplicate": True, "conversion_id": existing["id"], "matched_click_id": rec["matched_click_id"]}
     cur = conn.execute("""INSERT INTO conversions
-      (received_at,offer_id,offer_name,load_id,transaction_id,status,aff_rev,aff_rev_real,real_currency,currency,click_id,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_adposition,utm_creative,utm_device,gclid,matched_click_id,raw_json)
-      VALUES (%(received_at)s,%(offer_id)s,%(offer_name)s,%(load_id)s,%(transaction_id)s,%(status)s,%(aff_rev)s,%(aff_rev_real)s,%(real_currency)s,%(currency)s,%(click_id)s,%(subid)s,%(subid2)s,%(subid3)s,%(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_term)s,%(utm_adgroup)s,%(utm_adposition)s,%(utm_creative)s,%(utm_device)s,%(gclid)s,%(matched_click_id)s,%(raw_json)s) RETURNING id""", rec)
+      (received_at,offer_id,offer_name,load_id,transaction_id,status,aff_rev,aff_rev_real,real_currency,currency,click_id,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_adposition,utm_creative,utm_device,gclid,matched_click_id,raw_json,utm_content,utm_source_platform,utm_placement,campaign_id,campaign_name,adgroup_id,adgroup_name,creative_id,creative_name,fbclid,msclkid,ttclid)
+      VALUES (%(received_at)s,%(offer_id)s,%(offer_name)s,%(load_id)s,%(transaction_id)s,%(status)s,%(aff_rev)s,%(aff_rev_real)s,%(real_currency)s,%(currency)s,%(click_id)s,%(subid)s,%(subid2)s,%(subid3)s,%(utm_source)s,%(utm_medium)s,%(utm_campaign)s,%(utm_term)s,%(utm_adgroup)s,%(utm_adposition)s,%(utm_creative)s,%(utm_device)s,%(gclid)s,%(matched_click_id)s,%(raw_json)s,%(utm_content)s,%(utm_source_platform)s,%(utm_placement)s,%(campaign_id)s,%(campaign_name)s,%(adgroup_id)s,%(adgroup_name)s,%(creative_id)s,%(creative_name)s,%(fbclid)s,%(msclkid)s,%(ttclid)s) RETURNING id""", rec)
     cid = cur.fetchone()["id"]; conn.commit(); conn.close()
     return {"ok": True, "duplicate": False, "conversion_id": cid, "matched_click_id": rec["matched_click_id"]}
 
@@ -385,7 +452,7 @@ async def postback(request: Request):
 
 LOGIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker — Login</title><style>body{font-family:system-ui;background:#0f1115;color:#eee;display:grid;place-items:center;min-height:100vh;margin:0}.box{width:min(420px,90vw);background:#191c23;padding:28px;border-radius:16px;box-sizing:border-box}input,button{width:100%;box-sizing:border-box;padding:13px;margin-top:10px;border-radius:10px;border:1px solid #343944;background:#0f1115;color:#fff}button{background:#fff;color:#111;font-weight:700;cursor:pointer}</style></head><body><div class=\"box\"><h2>CPA Tracker</h2><p>Адмін-доступ</p><form method=\"post\" action=\"/admin/login\"><input name=\"token\" type=\"password\" placeholder=\"ADMIN_TOKEN\" autocomplete=\"current-password\" required><button>Увійти</button></form></div></body></html>"""
 
-ADMIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker Dashboard</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d11;color:#eee;margin:0}.wrap{max-width:1200px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#9aa1ad}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}.card{background:#171a21;border:1px solid #272c36;border-radius:14px;padding:14px}.label{color:#9aa1ad;font-size:12px}.value{font-size:22px;font-weight:750;margin-top:4px}section{background:#12151b;border:1px solid #272c36;border-radius:14px;padding:14px;margin-top:14px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:9px;border-bottom:1px solid #252a33;font-size:13px}th{color:#aeb5c1}button{border:1px solid #343a46;background:#1a1e27;color:#fff;padding:9px 12px;border-radius:9px;cursor:pointer}.danger{border-color:#6d3030}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}select{background:#171a21;color:#fff;border:1px solid #343a46;padding:9px;border-radius:9px}.pos{color:#76e09b}.neg{color:#ff8c8c}@media(max-width:600px){.wrap{padding:10px}.value{font-size:19px}}</style></head><body><div class=\"wrap\"><div class=\"top\"><div><h2 style=\"margin:0\">CPA Tracker</h2><div class=\"muted\">Адмін-панель · v0.4.0</div></div><div class=\"toolbar\"><button onclick=\"loadAll()\">Оновити</button><form method=\"post\" action=\"/admin/logout\"><button class=\"danger\">Вийти</button></form></div></div><div id=\"cards\" class=\"cards\"></div><section><div class=\"toolbar\"><b>Звіт</b><select id=\"group\" onchange=\"loadReport()\"><option value=\"campaign\">Campaign</option><option value=\"adgroup\">Ad Group</option><option value=\"creative\">Creative</option><option value=\"keyword\">Keyword</option></select></div><div id=\"report\" style=\"margin-top:10px\"></div></section><section><b>Останні конверсії</b><div id=\"convs\" style=\"margin-top:10px\"></div></section><section><div class=\"toolbar\"><b>Витрати</b><span class=\"muted\">CSV: spent_at, source, campaign, amount</span></div><form id=\"spendForm\" style=\"margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center\"><input id=\"spendFile\" type=\"file\" accept=\".csv,text/csv\" required style=\"max-width:100%\"><button type=\"submit\">Імпортувати CSV</button></form><div id=\"spendMsg\" class=\"muted\" style=\"margin-top:8px\"></div><div id=\"spend\" style=\"margin-top:10px\"></div></section><section><b>Останні кліки</b><div id=\"clicks\" style=\"margin-top:10px\"></div></section></div><script>const money=x=>x==null?'—':Number(x).toLocaleString('uk-UA',{minimumFractionDigits:2,maximumFractionDigits:2})+' ₴';const pct=x=>x==null?'—':Number(x).toFixed(2)+'%';async function api(u){let r=await fetch(u,{credentials:'same-origin'});if(!r.ok){if(r.status===401)location.reload();throw new Error(await r.text())}return r.json()}function card(label,val){return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value\">${val}</div></div>`}async function loadStats(){let d=await api('/admin/stats');let cr=d.clicks?d.approved/d.clicks*100:null;document.getElementById('cards').innerHTML=[card('Clicks',d.clicks),card('Conversions',d.conversions),card('Approved',d.approved),card('CR',pct(cr)),card('Revenue',money(d.revenue_uah)),card('Spend',money(d.spend_uah)),card('Profit',`<span class=\"${d.profit_uah>=0?'pos':'neg'}\">${money(d.profit_uah)}</span>`),card('ROI',d.roi_percent==null?'—':pct(d.roi_percent))].join('')}async function loadReport(){let g=document.getElementById('group').value;let d=await api('/admin/report?group='+encodeURIComponent(g));let h='<table><tr><th>Group</th><th>Clicks</th><th>Conv.</th><th>Approved</th><th>CR</th><th>Revenue</th><th>Spend</th><th>Profit</th><th>ROI</th><th>EPC</th><th>CPA</th></tr>';for(let r of d.rows){h+=`<tr><td>${esc(r.group)}</td><td>${r.clicks}</td><td>${r.conversions}</td><td>${r.approved}</td><td>${pct(r.cr_click_to_approved_percent)}</td><td>${money(r.revenue_uah)}</td><td>${money(r.spend_uah)}</td><td class=\"${r.profit_uah>=0?'pos':'neg'}\">${money(r.profit_uah)}</td><td>${r.roi_percent==null?'—':pct(r.roi_percent)}</td><td>${r.epc_uah==null?'—':Number(r.epc_uah).toFixed(4)+' ₴'}</td><td>${r.cpa_uah==null?'—':money(r.cpa_uah)}</td></tr>`}h+='</table>';document.getElementById('report').innerHTML=h}async function loadConv(){let a=await api('/admin/conversions');let h='<table><tr><th>Time</th><th>Offer</th><th>Status</th><th>Revenue</th><th>Campaign</th><th>Click ID</th><th>Matched</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.received_at)}</td><td>${esc(r.offer_name||r.offer_id||'')}</td><td>${esc(r.status||'')}</td><td>${money(r.aff_rev_real??r.aff_rev)}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.click_id||'')}</td><td>${esc(r.matched_click_id||'')}</td></tr>`}document.getElementById('convs').innerHTML=h+'</table>'}async function loadClicks(){let a=await api('/admin/clicks');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign ID</th><th>Campaign</th><th>Ad Group ID</th><th>Ad Group</th><th>Creative ID</th><th>Keyword</th><th>Device</th><th>Click IDs</th></tr>';for(let r of a.slice(0,50)){let ids=[r.gclid&&('G:'+r.gclid),r.fbclid&&('F:'+r.fbclid)].filter(Boolean).join(' ');h+=`<tr><td>${esc(r.created_at)}</td><td>${esc(r.utm_source||'')}</td><td>${esc(r.campaign_id||'')}</td><td>${esc(r.campaign_name||r.utm_campaign||'')}</td><td>${esc(r.adgroup_id||'')}</td><td>${esc(r.adgroup_name||r.utm_adgroup||'')}</td><td>${esc(r.creative_id||r.utm_creative||'')}</td><td>${esc(r.utm_term||'')}</td><td>${esc(r.utm_device||'')}</td><td>${esc(ids)}</td></tr>`}document.getElementById('clicks').innerHTML=h+'</table>'}async function loadSpend(){let a=await api('/admin/spend');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign</th><th>Ad Group</th><th>Creative</th><th>Keyword</th><th>Amount</th><th>Currency</th><th>ID</th><th>Дія</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.spent_at)}</td><td>${esc(r.source)}</td><td>${esc(r.campaign)}</td><td>${esc(r.adgroup||'')}</td><td>${esc(r.creative||'')}</td><td>${esc(r.keyword||'')}</td><td>${money(r.amount)}</td><td>${esc(r.currency||'')}</td><td>${esc(r.external_id||'')}</td><td><button class="danger" onclick="deleteSpend(${r.id})">Видалити</button></td></tr>`}document.getElementById('spend').innerHTML=h+'</table>'}async function deleteSpend(id){if(!confirm('Видалити цей запис витрат? Це змінить Spend, Profit та ROI.'))return;let r=await fetch('/admin/spend/'+id,{method:'DELETE',credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка видалення');document.getElementById('spendMsg').textContent=`Витрату #${id} видалено`;await loadAll()}async function importSpend(e){e.preventDefault();let f=document.getElementById('spendFile').files[0];if(!f)return;let fd=new FormData();fd.append('file',f);let r=await fetch('/admin/spend/csv',{method:'POST',body:fd,credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка імпорту');document.getElementById('spendMsg').textContent=`Додано: ${d.added} · Дублікати: ${d.duplicates} · Пропущено: ${d.skipped}`;document.getElementById('spendFile').value='';await loadAll()}function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function loadAll(){try{await Promise.all([loadStats(),loadReport(),loadConv(),loadClicks(),loadSpend()])}catch(e){document.body.insertAdjacentHTML('beforeend',`<div style=\"position:fixed;bottom:10px;left:10px;right:10px;background:#4a2020;padding:12px;border-radius:10px\">Помилка: ${esc(e.message)}</div>`)}}document.getElementById('spendForm').addEventListener('submit',importSpend);loadAll();setInterval(loadAll,60000);</script></body></html>"""
+ADMIN_HTML = """<!doctype html><html lang=\"uk\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>CPA Tracker Dashboard</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#0b0d11;color:#eee;margin:0}.wrap{max-width:1200px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#9aa1ad}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:16px 0}.card{background:#171a21;border:1px solid #272c36;border-radius:14px;padding:14px}.label{color:#9aa1ad;font-size:12px}.value{font-size:22px;font-weight:750;margin-top:4px}section{background:#12151b;border:1px solid #272c36;border-radius:14px;padding:14px;margin-top:14px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:760px}th,td{text-align:left;padding:9px;border-bottom:1px solid #252a33;font-size:13px}th{color:#aeb5c1}button{border:1px solid #343a46;background:#1a1e27;color:#fff;padding:9px 12px;border-radius:9px;cursor:pointer}.danger{border-color:#6d3030}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}select{background:#171a21;color:#fff;border:1px solid #343a46;padding:9px;border-radius:9px}.pos{color:#76e09b}.neg{color:#ff8c8c}@media(max-width:600px){.wrap{padding:10px}.value{font-size:19px}}</style></head><body><div class=\"wrap\"><div class=\"top\"><div><h2 style=\"margin:0\">CPA Tracker</h2><div class=\"muted\">Адмін-панель · v0.4.0</div></div><div class=\"toolbar\"><button onclick=\"loadAll()\">Оновити</button><form method=\"post\" action=\"/admin/logout\"><button class=\"danger\">Вийти</button></form></div></div><div id=\"cards\" class=\"cards\"></div><section><div class=\"toolbar\"><b>Звіт</b><select id=\"group\" onchange=\"loadReport()\"><option value=\"campaign\">Campaign</option><option value=\"adgroup\">Ad Group</option><option value=\"creative\">Creative</option><option value=\"keyword\">Keyword</option></select></div><div id=\"report\" style=\"margin-top:10px\"></div></section><section><b>Останні конверсії</b><div id=\"convs\" style=\"margin-top:10px\"></div></section><section><div class=\"toolbar\"><b>Витрати</b><span class=\"muted\">CSV: spent_at, source, campaign, amount</span></div><form id=\"spendForm\" style=\"margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center\"><input id=\"spendFile\" type=\"file\" accept=\".csv,text/csv\" required style=\"max-width:100%\"><button type=\"submit\">Імпортувати CSV</button></form><div id=\"spendMsg\" class=\"muted\" style=\"margin-top:8px\"></div><div id=\"spend\" style=\"margin-top:10px\"></div></section><section><b>Останні кліки</b><div id=\"clicks\" style=\"margin-top:10px\"></div></section></div><script>const money=x=>x==null?'—':Number(x).toLocaleString('uk-UA',{minimumFractionDigits:2,maximumFractionDigits:2})+' ₴';const pct=x=>x==null?'—':Number(x).toFixed(2)+'%';async function api(u){let r=await fetch(u,{credentials:'same-origin'});if(!r.ok){if(r.status===401)location.reload();throw new Error(await r.text())}return r.json()}function card(label,val){return `<div class=\"card\"><div class=\"label\">${label}</div><div class=\"value\">${val}</div></div>`}async function loadStats(){let d=await api('/admin/stats');let cr=d.clicks?d.approved/d.clicks*100:null;document.getElementById('cards').innerHTML=[card('Clicks',d.clicks),card('Conversions',d.conversions),card('Approved',d.approved),card('CR',pct(cr)),card('Revenue',money(d.revenue_uah)),card('Spend',money(d.spend_uah)),card('Profit',`<span class=\"${d.profit_uah>=0?'pos':'neg'}\">${money(d.profit_uah)}</span>`),card('ROI',d.roi_percent==null?'—':pct(d.roi_percent))].join('')}async function loadReport(){let g=document.getElementById('group').value;let d=await api('/admin/report?group='+encodeURIComponent(g));let h='<table><tr><th>Group</th><th>Clicks</th><th>Conv.</th><th>Approved</th><th>CR</th><th>Revenue</th><th>Spend</th><th>Profit</th><th>ROI</th><th>EPC</th><th>CPA</th></tr>';for(let r of d.rows){h+=`<tr><td>${esc(r.group)}</td><td>${r.clicks}</td><td>${r.conversions}</td><td>${r.approved}</td><td>${pct(r.cr_click_to_approved_percent)}</td><td>${money(r.revenue_uah)}</td><td>${money(r.spend_uah)}</td><td class=\"${r.profit_uah>=0?'pos':'neg'}\">${money(r.profit_uah)}</td><td>${r.roi_percent==null?'—':pct(r.roi_percent)}</td><td>${r.epc_uah==null?'—':Number(r.epc_uah).toFixed(4)+' ₴'}</td><td>${r.cpa_uah==null?'—':money(r.cpa_uah)}</td></tr>`}h+='</table>';document.getElementById('report').innerHTML=h}async function loadConv(){let a=await api('/admin/conversions');let h='<table><tr><th>Time</th><th>Offer</th><th>Status</th><th>Revenue</th><th>Source</th><th>Campaign</th><th>Click ID</th><th>Matched</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.received_at)}</td><td>${esc(r.offer_name||r.offer_id||'')}</td><td>${esc(r.status||'')}</td><td>${money(r.aff_rev_real??r.aff_rev)}</td><td>${esc(r.utm_source||'')}</td><td>${esc(r.utm_campaign||'')}</td><td>${esc(r.click_id||'')}</td><td>${esc(r.matched_click_id||'')}</td></tr>`}document.getElementById('convs').innerHTML=h+'</table>'}async function loadClicks(){let a=await api('/admin/clicks');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign ID</th><th>Campaign</th><th>Ad Group ID</th><th>Ad Group</th><th>Creative ID</th><th>Keyword</th><th>Device</th><th>Click IDs</th></tr>';for(let r of a.slice(0,50)){let ids=[r.gclid&&('G:'+r.gclid),r.fbclid&&('F:'+r.fbclid),r.msclkid&&('M:'+r.msclkid),r.ttclid&&('T:'+r.ttclid)].filter(Boolean).join(' ');h+=`<tr><td>${esc(r.created_at)}</td><td>${esc(r.utm_source||'')}</td><td>${esc(r.campaign_id||'')}</td><td>${esc(r.campaign_name||r.utm_campaign||'')}</td><td>${esc(r.adgroup_id||'')}</td><td>${esc(r.adgroup_name||r.utm_adgroup||'')}</td><td>${esc(r.creative_id||r.utm_creative||'')}</td><td>${esc(r.utm_term||'')}</td><td>${esc(r.utm_device||'')}</td><td>${esc(ids)}</td></tr>`}document.getElementById('clicks').innerHTML=h+'</table>'}async function loadSpend(){let a=await api('/admin/spend');let h='<table><tr><th>Time</th><th>Source</th><th>Campaign</th><th>Ad Group</th><th>Creative</th><th>Keyword</th><th>Amount</th><th>Currency</th><th>ID</th><th>Дія</th></tr>';for(let r of a.slice(0,50)){h+=`<tr><td>${esc(r.spent_at)}</td><td>${esc(r.source)}</td><td>${esc(r.campaign)}</td><td>${esc(r.adgroup||'')}</td><td>${esc(r.creative||'')}</td><td>${esc(r.keyword||'')}</td><td>${money(r.amount)}</td><td>${esc(r.currency||'')}</td><td>${esc(r.external_id||'')}</td><td><button class="danger" onclick="deleteSpend(${r.id})">Видалити</button></td></tr>`}document.getElementById('spend').innerHTML=h+'</table>'}async function deleteSpend(id){if(!confirm('Видалити цей запис витрат? Це змінить Spend, Profit та ROI.'))return;let r=await fetch('/admin/spend/'+id,{method:'DELETE',credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка видалення');document.getElementById('spendMsg').textContent=`Витрату #${id} видалено`;await loadAll()}async function importSpend(e){e.preventDefault();let f=document.getElementById('spendFile').files[0];if(!f)return;let fd=new FormData();fd.append('file',f);let r=await fetch('/admin/spend/csv',{method:'POST',body:fd,credentials:'same-origin'});let d;try{d=await r.json()}catch(_){d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||'Помилка імпорту');document.getElementById('spendMsg').textContent=`Додано: ${d.added} · Дублікати: ${d.duplicates} · Пропущено: ${d.skipped}`;document.getElementById('spendFile').value='';await loadAll()}function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function loadAll(){try{await Promise.all([loadStats(),loadReport(),loadConv(),loadClicks(),loadSpend()])}catch(e){document.body.insertAdjacentHTML('beforeend',`<div style=\"position:fixed;bottom:10px;left:10px;right:10px;background:#4a2020;padding:12px;border-radius:10px\">Помилка: ${esc(e.message)}</div>`)}}document.getElementById('spendForm').addEventListener('submit',importSpend);loadAll();setInterval(loadAll,60000);</script></body></html>"""
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(request: Request):
@@ -433,7 +500,7 @@ def recent_clicks(request: Request):
 
 @app.get("/admin/conversions")
 def recent_conversions(request: Request):
-    check_admin(request); conn=db(); rows=conn.execute("SELECT id,received_at,offer_id,offer_name,load_id,transaction_id,status,aff_rev,aff_rev_real,real_currency,currency,click_id,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_adposition,utm_creative,utm_device,gclid,matched_click_id FROM conversions ORDER BY received_at DESC LIMIT 200").fetchall(); conn.close(); return [dict(r) for r in rows]
+    check_admin(request); conn=db(); rows=conn.execute("SELECT id,received_at,offer_id,offer_name,load_id,transaction_id,status,aff_rev,aff_rev_real,real_currency,currency,click_id,subid,subid2,subid3,utm_source,utm_medium,utm_campaign,utm_term,utm_adgroup,utm_adposition,utm_creative,utm_device,gclid,fbclid,msclkid,ttclid,campaign_id,campaign_name,adgroup_id,adgroup_name,creative_id,creative_name,matched_click_id FROM conversions ORDER BY received_at DESC LIMIT 200").fetchall(); conn.close(); return [dict(r) for r in rows]
 
 
 @app.get("/admin/spend")
@@ -507,7 +574,10 @@ def build_report(conn, start=None, end=None, group_fields=("campaign",)):
     click_where, click_params = date_filter("c.created_at", start, end)
     spend_where, spend_params = date_filter("s.spent_at", start, end)
     # Only UAH is aggregated into the financial report in v0.3.
-    if group_fields == ("campaign",):
+    if group_fields == ("source",):
+        group_sql = "COALESCE(NULLIF(c.utm_source,''),'(no_source)')"
+        spend_group = "s.source"
+    elif group_fields == ("campaign",):
         group_sql = "COALESCE(NULLIF(c.utm_campaign,''),'(no_campaign)')"
         spend_group = "s.campaign"
     elif group_fields == ("campaign","adgroup"):
@@ -541,8 +611,8 @@ def build_report(conn, start=None, end=None, group_fields=("campaign",)):
 @app.get("/admin/report")
 def report(request: Request, start: str|None=None, end: str|None=None, group: str="campaign"):
     check_admin(request); conn=db()
-    groups={"campaign":("campaign",),"adgroup":("campaign","adgroup"),"creative":("campaign","creative"),"keyword":("campaign","keyword")}
-    if group not in groups: raise HTTPException(400,"group must be campaign, adgroup, creative or keyword")
+    groups={"source":("source",),"campaign":("campaign",),"adgroup":("campaign","adgroup"),"creative":("campaign","creative"),"keyword":("campaign","keyword")}
+    if group not in groups: raise HTTPException(400,"group must be source, campaign, adgroup, creative or keyword")
     rows=build_report(conn,start,end,groups[group]); conn.close()
     totals={k:0 for k in ["clicks","conversions","approved","revenue_uah","spend_uah","profit_uah"]}
     for r in rows:
@@ -556,8 +626,30 @@ def campaigns(request: Request, start: str|None=None, end: str|None=None):
     check_admin(request); conn=db(); rows=build_report(conn,start,end,("campaign",)); conn.close(); return rows
 
 
+@app.get("/admin/offers")
+def list_offers(request: Request):
+    check_admin(request)
+    conn = db()
+    rows = conn.execute("SELECT id,name,payout,currency,active,target_url,created_at FROM offers ORDER BY name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 @app.post("/admin/offers")
 async def add_offer(request: Request):
-    check_admin(request); data=await request.json(); oid=clean(data.get("id")); name=clean(data.get("name"))
-    if not oid or not name: raise HTTPException(400,"id and name are required")
-    conn=db(); conn.execute("""INSERT INTO offers(id,name,payout,currency,active,created_at) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,payout=EXCLUDED.payout,currency=EXCLUDED.currency,active=EXCLUDED.active""",(oid,name,parse_float(data.get("payout")),clean(data.get("currency")) or "UAH",1 if data.get("active",True) else 0,now())); conn.commit(); conn.close(); return {"ok":True,"id":oid}
+    check_admin(request)
+    data=await request.json()
+    oid=clean(data.get("id")); name=clean(data.get("name"))
+    if not oid or not name:
+        raise HTTPException(400,"id and name are required")
+    target_url=clean(data.get("target_url"))
+    conn=db()
+    conn.execute("""INSERT INTO offers(id,name,payout,currency,active,target_url,created_at)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO UPDATE SET
+                      name=EXCLUDED.name,payout=EXCLUDED.payout,currency=EXCLUDED.currency,
+                      active=EXCLUDED.active,target_url=EXCLUDED.target_url""",
+                 (oid,name,parse_float(data.get("payout")),clean(data.get("currency")) or "UAH",
+                  1 if data.get("active",True) else 0,target_url,now()))
+    conn.commit(); conn.close()
+    return {"ok":True,"id":oid}
